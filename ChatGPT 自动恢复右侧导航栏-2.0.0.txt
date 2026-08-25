@@ -1,0 +1,104 @@
+// ==UserScript==
+// @name         ChatGPT 自动恢复右侧导航栏
+// @namespace    chatgpt-native-navigation-fix
+// @version      2.0.0
+// @description  自动为 ChatGPT 对话 URL 添加 ?message=，恢复原生右侧导航栏
+// @match        https://chatgpt.com/*
+// @match        https://www.chatgpt.com/*
+// @grant        none
+// @run-at       document-start
+// @noframes
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window.self !== window.top) {
+        return;
+    }
+
+    let lastUrl = '';
+
+    function isConversationPage() {
+        /*
+         * 普通对话：
+         * /c/xxxxxxxx
+         *
+         * 项目中的对话路径即使更长，
+         * 只要里面包含 /c/xxxxxxxx 也能识别。
+         */
+        return /\/c\/[^/?#]+/.test(location.pathname);
+    }
+
+    function fixNavigation() {
+
+        const currentUrl = location.href;
+
+        /*
+         * URL 没变化就不用重复检查。
+         */
+        if (currentUrl === lastUrl) {
+            return;
+        }
+
+        lastUrl = currentUrl;
+
+        /*
+         * 首页、新建对话等页面不处理。
+         */
+        if (!isConversationPage()) {
+            return;
+        }
+
+        const url = new URL(location.href);
+
+        /*
+         * 已经有 message 参数：
+         * 什么都不做，防止无限刷新。
+         */
+        if (url.searchParams.has('message')) {
+            return;
+        }
+
+        /*
+         * 添加：
+         *
+         * ?message=
+         *
+         * 如果原来已经有其他参数，
+         * URL API 会自动变成：
+         *
+         * ?xxx=xxx&message=
+         */
+        url.searchParams.set('message', '');
+
+        console.log(
+            '[ChatGPT Navigation Fix] 添加 message 参数并刷新：',
+            url.href
+        );
+
+        /*
+         * replace 不会额外增加一条浏览器历史记录。
+         */
+        location.replace(url.href);
+    }
+
+    /*
+     * 首次打开网页立即检查。
+     */
+    fixNavigation();
+
+    /*
+     * ChatGPT 是 SPA。
+     *
+     * 点击左侧另一个对话时通常不会完整刷新页面，
+     * 所以定期检查 URL 是否发生变化。
+     *
+     * 这里只比较一个字符串，开销基本可以忽略。
+     */
+    setInterval(
+        fixNavigation,
+        300
+    );
+
+})();

@@ -1,0 +1,2132 @@
+// ==UserScript==
+// @name         ChatGPT 原生时间轴自动唤醒
+// @namespace    chatgpt-native-timeline-wake
+// @version      1.0.0
+// @description  自动唤醒 ChatGPT 原生右侧对话时间轴；兼容超长对话和项目对话
+// @match        https://chatgpt.com/*
+// @match        https://www.chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /*
+     * ==================================================
+     * 防止 iframe / 重复运行
+     * ==================================================
+     */
+
+    if (window.self !== window.top) {
+        return;
+    }
+
+    if (window.__CHATGPT_NATIVE_TIMELINE_WAKE__) {
+        return;
+    }
+
+    window.__CHATGPT_NATIVE_TIMELINE_WAKE__ = true;
+
+
+    /*
+     * ==================================================
+     * 参数
+     * ==================================================
+     */
+
+    const CONFIG = {
+
+        /*
+         * 等待当前 conversation 的 DOM 出现。
+         *
+         * 项目对话有时加载稍慢，所以留得比较宽裕。
+         */
+        conversationTimeout: 15000,
+
+        /*
+         * 正常向上滚动时，
+         * 每次大约跨 8 个屏幕。
+         */
+        stepScreens: 8,
+
+        /*
+         * 每次高速滚动后给浏览器处理 DOM 的时间。
+         *
+         * 这里只是 UI 调度等待，
+         * 不是网络等待。
+         */
+        scrollDelay: 50,
+
+        /*
+         * 到达当前虚拟列表顶部后，
+         * 最多等待旧消息加载的时间。
+         *
+         * 一旦检测到更早消息，会立即继续，
+         * 不会固定等待满 5 秒。
+         */
+        olderContentTimeout: 5000,
+
+        /*
+         * 第一次旧消息加载失败以后，
+         * 每次重新触发顶部加载最多等待多久。
+         */
+        retryTimeout: 2500,
+
+        /*
+         * 当前虚拟列表顶部没有继续加载内容时，
+         * 最多重新撞顶部几次。
+         */
+        maxRetries: 3,
+
+        /*
+         * 检测到原生时间轴以后，
+         * 给 React 极短时间稳定 UI，
+         * 然后立即返回原来的位置。
+         */
+        timelineSettleDelay: 180,
+
+        /*
+         * 已经确认到真正顶部，
+         * 但还没识别到时间轴时，
+         * 最多再等待一下。
+         */
+        finalTimelineWait: 1500,
+
+        /*
+         * 切换 conversation 后，
+         * 稍等页面开始挂载再执行。
+         */
+        routeDelay: 500
+    };
+
+
+    /*
+     * ==================================================
+     * 全局状态
+     * ==================================================
+     */
+
+    /*
+     * 每启动一个新任务就递增。
+     *
+     * 用户中途切换 conversation 时，
+     * 旧的异步任务就会自动失效。
+     */
+    let runSerial = 0;
+
+    /*
+     * 当前 conversation ID。
+     */
+    let lastConversationKey = null;
+
+    /*
+     * 延迟启动 timer。
+     */
+    let scheduledTimer = null;
+
+
+    /*
+     * ==================================================
+     * 基础工具
+     * ==================================================
+     */
+
+    const sleep = ms =>
+        new Promise(resolve => setTimeout(resolve, ms));
+
+
+    /*
+     * 从 URL 获取当前 conversation ID。
+     *
+     * 普通对话、项目中的对话路径虽然可能不同，
+     * 但 conversation 页面通常都包含：
+     *
+     * /c/<conversation-id>
+     */
+    function getConversationKey() {
+
+        const match =
+            location.pathname.match(
+                /\/c\/([^/?#]+)/
+            );
+
+        return match
+            ? match[1]
+            : null;
+    }
+
+
+    /*
+     * 判断当前异步任务是否仍然属于
+     * 用户目前正在看的 conversation。
+     */
+    function runStillValid(
+        serial,
+        conversationKey
+    ) {
+
+        return (
+            serial === runSerial &&
+            conversationKey === getConversationKey()
+        );
+    }
+
+
+    /*
+     * ==================================================
+     * 查找 ChatGPT 对话 DOM
+     * ==================================================
+     */
+
+    /*
+     * 不限定 article / section，
+     * 只依赖 ChatGPT 消息本身比较稳定的属性。
+     */
+    function findAnyTurn() {
+
+        return (
+            document.querySelector(
+                '[data-testid^="conversation-turn-"]'
+            )
+
+            ||
+
+            document.querySelector(
+                '[data-turn="user"]'
+            )
+
+            ||
+
+            document.querySelector(
+                '[data-turn="assistant"]'
+            )
+
+            ||
+
+            document.querySelector(
+                '[data-message-author-role="user"]'
+            )
+
+            ||
+
+            document.querySelector(
+                '[data-message-author-role="assistant"]'
+            )
+        );
+    }
+
+
+    /*
+     * 等待 conversation DOM 真正出现。
+     *
+     * 用循环等待，而不是固定 sleep，
+     * 因此也能处理项目对话加载比较慢的情况。
+     */
+    async function waitForConversation(
+        serial,
+        conversationKey
+    ) {
+
+        const start =
+            Date.now();
+
+
+        while (
+            Date.now() - start <
+            CONFIG.conversationTimeout
+        ) {
+
+            /*
+             * 用户已经切换到其他 conversation。
+             */
+            if (
+                !runStillValid(
+                    serial,
+                    conversationKey
+                )
+            ) {
+
+                return null;
+            }
+
+
+            const turn =
+                findAnyTurn();
+
+
+            if (turn) {
+
+                return turn;
+            }
+
+
+            await sleep(250);
+        }
+
+
+        return null;
+    }
+
+
+    /*
+     * ==================================================
+     * 找真正负责对话滚动的元素
+     * ==================================================
+     */
+
+    function findScroller(element) {
+
+        let node =
+            element;
+
+
+        while (node) {
+
+            if (
+                node instanceof HTMLElement
+            ) {
+
+                const style =
+                    getComputedStyle(node);
+
+                const range =
+                    node.scrollHeight -
+                    node.clientHeight;
+
+
+                if (
+                    range > 300 &&
+                    /(auto|scroll|overlay)/.test(
+                        style.overflowY
+                    )
+                ) {
+
+                    return node;
+                }
+            }
+
+
+            node =
+                node.parentElement;
+        }
+
+
+        /*
+         * 最后兜底。
+         */
+        return (
+            document.scrollingElement ||
+            document.documentElement
+        );
+    }
+
+
+    /*
+     * ==================================================
+     * conversation-turn 编号
+     * ==================================================
+     */
+
+    function getMountedTurnNumbers() {
+
+        return [
+            ...document.querySelectorAll(
+                '[data-testid^="conversation-turn-"]'
+            )
+        ]
+        .map(el => {
+
+            const value =
+                el.getAttribute(
+                    'data-testid'
+                );
+
+            const match =
+                value?.match(
+                    /conversation-turn-(\d+)/
+                );
+
+
+            return match
+                ? Number(match[1])
+                : null;
+        })
+        .filter(Number.isFinite);
+    }
+
+
+    function getMinMountedTurn() {
+
+        const numbers =
+            getMountedTurnNumbers();
+
+
+        if (!numbers.length) {
+            return null;
+        }
+
+
+        return Math.min(
+            ...numbers
+        );
+    }
+
+
+    /*
+     * ==================================================
+     * 原生右侧时间轴检测
+     * ==================================================
+     *
+     * 不依赖 ChatGPT 动态 class 名。
+     *
+     * 根据原生时间轴稳定的视觉结构检测：
+     *
+     * 1. 位于页面最右侧
+     * 2. 多根细水平线
+     * 3. 横线宽度大约 8~60px
+     * 4. 高度约 1~10px
+     * 5. 多根线基本纵向对齐
+     *
+     * 至少检测到 5 根才认为时间轴已经出现。
+     */
+
+    function detectNativeTimeline() {
+
+        const width =
+            window.innerWidth;
+
+        const height =
+            window.innerHeight;
+
+
+        if (
+            width < 300 ||
+            height < 300
+        ) {
+
+            return false;
+        }
+
+
+        /*
+         * 在页面最右侧几个 x 坐标进行采样。
+         */
+        const sampleXs = [
+
+            width - 24,
+
+            width - 30,
+
+            width - 36,
+
+            width - 42
+        ];
+
+
+        const candidates =
+            new Set();
+
+
+        /*
+         * 从顶部 70px 到底部 80px 范围扫描。
+         */
+        for (
+            let y = 70;
+            y < height - 80;
+            y += 2
+        ) {
+
+            for (
+                const x of sampleXs
+            ) {
+
+                if (
+                    x <= 0 ||
+                    x >= width
+                ) {
+
+                    continue;
+                }
+
+
+                let el =
+                    document.elementFromPoint(
+                        x,
+                        y
+                    );
+
+
+                /*
+                 * 有时 elementFromPoint 命中的是
+                 * 横线里面的子节点，
+                 * 所以向上检查几层。
+                 */
+                for (
+                    let level = 0;
+                    level < 3 && el;
+                    level++
+                ) {
+
+                    if (
+                        el instanceof HTMLElement
+                    ) {
+
+                        const rect =
+                            el.getBoundingClientRect();
+
+                        const style =
+                            getComputedStyle(el);
+
+
+                        const visible =
+
+                            style.display !== 'none' &&
+
+                            style.visibility !== 'hidden' &&
+
+                            Number(
+                                style.opacity || 1
+                            ) > 0;
+
+
+                        const looksLikeBar =
+
+                            visible &&
+
+                            rect.width >= 8 &&
+
+                            rect.width <= 60 &&
+
+                            rect.height >= 1 &&
+
+                            rect.height <= 10 &&
+
+                            rect.right >
+                                width - 70 &&
+
+                            rect.left >
+                                width - 100 &&
+
+                            rect.top > 60 &&
+
+                            rect.bottom <
+                                height - 60;
+
+
+                        if (
+                            looksLikeBar
+                        ) {
+
+                            candidates.add(el);
+
+                            break;
+                        }
+                    }
+
+
+                    el =
+                        el.parentElement;
+                }
+            }
+        }
+
+
+        if (
+            candidates.size < 5
+        ) {
+
+            return false;
+        }
+
+
+        /*
+         * 转换成几何 rect。
+         */
+        const rects =
+            [...candidates]
+                .map(
+                    el =>
+                        el.getBoundingClientRect()
+                );
+
+
+        /*
+         * 去掉同一个视觉横线对应的重复 DOM。
+         */
+        const unique =
+            [];
+
+
+        for (
+            const rect of rects
+        ) {
+
+            const cx =
+                rect.left +
+                rect.width / 2;
+
+            const cy =
+                rect.top +
+                rect.height / 2;
+
+
+            const duplicate =
+                unique.some(old => {
+
+                    const oldCx =
+                        old.left +
+                        old.width / 2;
+
+                    const oldCy =
+                        old.top +
+                        old.height / 2;
+
+
+                    return (
+                        Math.abs(
+                            cx - oldCx
+                        ) < 3
+
+                        &&
+
+                        Math.abs(
+                            cy - oldCy
+                        ) < 3
+                    );
+                });
+
+
+            if (
+                !duplicate
+            ) {
+
+                unique.push(
+                    rect
+                );
+            }
+        }
+
+
+        if (
+            unique.length < 5
+        ) {
+
+            return false;
+        }
+
+
+        /*
+         * 检查是否纵向对齐。
+         */
+        const centersX =
+            unique.map(
+                rect =>
+                    rect.left +
+                    rect.width / 2
+            );
+
+
+        const minX =
+            Math.min(
+                ...centersX
+            );
+
+        const maxX =
+            Math.max(
+                ...centersX
+            );
+
+
+        /*
+         * 横向太分散，
+         * 很可能只是页面右侧其他 UI。
+         */
+        if (
+            maxX - minX > 18
+        ) {
+
+            return false;
+        }
+
+
+        /*
+         * 检查纵向覆盖范围。
+         */
+        const centersY =
+            unique.map(
+                rect =>
+                    rect.top +
+                    rect.height / 2
+            );
+
+
+        const minY =
+            Math.min(
+                ...centersY
+            );
+
+        const maxY =
+            Math.max(
+                ...centersY
+            );
+
+
+        /*
+         * 如果几个元素全部挤在一起，
+         * 也不像真正时间轴。
+         */
+        if (
+            maxY - minY < 30
+        ) {
+
+            return false;
+        }
+
+
+        return true;
+    }
+
+
+    /*
+     * ==================================================
+     * 等待原生时间轴出现
+     * ==================================================
+     */
+
+    async function waitForTimeline(
+        serial,
+        conversationKey,
+        timeout
+    ) {
+
+        const start =
+            Date.now();
+
+
+        while (
+            Date.now() - start <
+            timeout
+        ) {
+
+            if (
+                !runStillValid(
+                    serial,
+                    conversationKey
+                )
+            ) {
+
+                return false;
+            }
+
+
+            if (
+                detectNativeTimeline()
+            ) {
+
+                return true;
+            }
+
+
+            await sleep(80);
+        }
+
+
+        return false;
+    }
+
+
+    /*
+     * ==================================================
+     * 保存用户原来的阅读位置
+     * ==================================================
+     */
+
+    function capturePosition(
+        scroller
+    ) {
+
+        const maxScroll =
+            Math.max(
+                0,
+
+                scroller.scrollHeight -
+                    scroller.clientHeight
+            );
+
+
+        const distanceFromBottom =
+            maxScroll -
+            scroller.scrollTop;
+
+
+        return {
+
+            top:
+                scroller.scrollTop,
+
+            max:
+                maxScroll,
+
+            ratio:
+                maxScroll > 0
+
+                    ? scroller.scrollTop /
+                      maxScroll
+
+                    : 1,
+
+            /*
+             * 距离底部小于 800px，
+             * 认为用户原本处在最新消息附近。
+             */
+            nearBottom:
+                distanceFromBottom <
+                800
+        };
+    }
+
+
+    /*
+     * ==================================================
+     * 恢复阅读位置
+     * ==================================================
+     */
+
+    function restorePosition(
+        scroller,
+        original
+    ) {
+
+        /*
+         * 加载大量历史消息之后，
+         * scrollHeight 会改变，
+         * 所以不能使用最开始保存的 maxScroll。
+         */
+        const newMax =
+            Math.max(
+                0,
+
+                scroller.scrollHeight -
+                    scroller.clientHeight
+            );
+
+
+        /*
+         * 最常见情况：
+         * 打开 conversation 时本来就在最后。
+         */
+        if (
+            original.nearBottom
+        ) {
+
+            scroller.scrollTo({
+
+                top:
+                    newMax,
+
+                behavior:
+                    'auto'
+            });
+
+
+            console.log(
+                '[Timeline] 已返回对话底部'
+            );
+        }
+
+
+        /*
+         * 如果用户原本在历史中间，
+         * 按原来的滚动比例恢复。
+         */
+        else {
+
+            scroller.scrollTo({
+
+                top:
+                    newMax *
+                    original.ratio,
+
+                behavior:
+                    'auto'
+            });
+
+
+            console.log(
+                '[Timeline] 已恢复原阅读位置'
+            );
+        }
+    }
+
+
+    /*
+     * ==================================================
+     * 等待 ChatGPT 加载更早消息
+     * ==================================================
+     *
+     * 不使用固定等待时间判断。
+     *
+     * 持续检测：
+     *
+     * 1. 时间轴是否出现
+     * 2. minTurn 是否变小
+     * 3. scrollHeight 是否增加
+     * 4. 是否明确出现 turn-0
+     */
+
+    async function waitForOlderContent(
+        scroller,
+        previousMin,
+        previousHeight,
+        timeout,
+        serial,
+        conversationKey
+    ) {
+
+        const start =
+            Date.now();
+
+
+        while (
+            Date.now() - start <
+            timeout
+        ) {
+
+            await sleep(100);
+
+
+            /*
+             * conversation 已切换。
+             */
+            if (
+                !runStillValid(
+                    serial,
+                    conversationKey
+                )
+            ) {
+
+                return {
+                    cancelled: true
+                };
+            }
+
+
+            /*
+             * ------------------------------------------
+             * 第一优先级：
+             * 原生时间轴已经出现
+             * ------------------------------------------
+             */
+
+            if (
+                detectNativeTimeline()
+            ) {
+
+                return {
+
+                    timeline: true,
+
+                    loaded: true,
+
+                    reachedStart: true
+                };
+            }
+
+
+            const currentMin =
+                getMinMountedTurn();
+
+
+            const currentHeight =
+                scroller.scrollHeight;
+
+
+            /*
+             * 明确出现 turn-0。
+             */
+            if (
+                currentMin === 0
+            ) {
+
+                return {
+
+                    timeline: false,
+
+                    loaded: true,
+
+                    reachedStart: true,
+
+                    minTurn:
+                        currentMin,
+
+                    height:
+                        currentHeight
+                };
+            }
+
+
+            /*
+             * 最早 turn 编号变小。
+             *
+             * 例如：
+             *
+             * 160 → 132
+             *
+             * 说明旧消息成功加载。
+             */
+            if (
+                currentMin !== null &&
+
+                previousMin !== null &&
+
+                currentMin <
+                    previousMin
+            ) {
+
+                return {
+
+                    timeline: false,
+
+                    loaded: true,
+
+                    reachedStart: false,
+
+                    minTurn:
+                        currentMin,
+
+                    height:
+                        currentHeight
+                };
+            }
+
+
+            /*
+             * 某些情况下 DOM 高度先变化，
+             * turn 编号稍后更新。
+             */
+            if (
+                currentHeight >
+                previousHeight + 100
+            ) {
+
+                return {
+
+                    timeline: false,
+
+                    loaded: true,
+
+                    reachedStart: false,
+
+                    minTurn:
+                        currentMin,
+
+                    height:
+                        currentHeight
+                };
+            }
+        }
+
+
+        /*
+         * timeout 内没有检测到任何变化。
+         */
+        return {
+
+            timeline: false,
+
+            loaded: false,
+
+            reachedStart: false,
+
+            minTurn:
+                getMinMountedTurn(),
+
+            height:
+                scroller.scrollHeight
+        };
+    }
+
+
+    /*
+     * ==================================================
+     * 向上寻找原生时间轴
+     * ==================================================
+     *
+     * 最终版不再设置：
+     *
+     * - 总运行时间限制
+     * - 总滚动轮数限制
+     *
+     * 只要还在正常加载更早内容，
+     * 就允许它一直继续。
+     */
+
+    async function crawlUntilTimeline(
+        initialScroller,
+        serial,
+        conversationKey
+    ) {
+
+        let scroller =
+            initialScroller;
+
+
+        let previousMin =
+            getMinMountedTurn();
+
+
+        let round =
+            0;
+
+
+        console.log(
+            '[Timeline] 开始唤醒原生时间轴',
+            '当前最早 turn =',
+            previousMin
+        );
+
+
+        /*
+         * ==================================================
+         * 无总时间限制 / 无总轮数限制
+         * ==================================================
+         */
+
+        while (true) {
+
+            round++;
+
+
+            /*
+             * ------------------------------------------
+             * 用户已经切换到别的 conversation
+             * ------------------------------------------
+             */
+
+            if (
+                !runStillValid(
+                    serial,
+                    conversationKey
+                )
+            ) {
+
+                return {
+
+                    success: false,
+
+                    cancelled: true,
+
+                    scroller
+                };
+            }
+
+
+            /*
+             * ==========================================
+             * 每一轮之前：
+             * 先检测原生时间轴。
+             *
+             * 一旦出现立即停止上滚。
+             * ==========================================
+             */
+
+            if (
+                detectNativeTimeline()
+            ) {
+
+                console.log(
+                    '[Timeline] 检测到原生时间轴，立即停止上滚'
+                );
+
+
+                return {
+
+                    success: true,
+
+                    reason:
+                        'timeline',
+
+                    scroller
+                };
+            }
+
+
+            /*
+             * DOM 虚拟化后重新确认滚动容器。
+             */
+            const turn =
+                findAnyTurn();
+
+
+            if (turn) {
+
+                scroller =
+                    findScroller(turn) ||
+                    scroller;
+            }
+
+
+            const currentMinBefore =
+                getMinMountedTurn();
+
+
+            /*
+             * ------------------------------------------
+             * 明确找到 turn-0
+             * ------------------------------------------
+             */
+
+            if (
+                currentMinBefore === 0
+            ) {
+
+                scroller.scrollTop =
+                    0;
+
+
+                const appeared =
+                    await waitForTimeline(
+
+                        serial,
+
+                        conversationKey,
+
+                        CONFIG.finalTimelineWait
+                    );
+
+
+                return {
+
+                    success: true,
+
+                    reason:
+                        appeared
+                            ? 'timeline'
+                            : 'turn-0',
+
+                    scroller
+                };
+            }
+
+
+            /*
+             * ==========================================
+             * 高速向上滚动
+             * ==========================================
+             */
+
+            const step =
+                Math.max(
+
+                    4000,
+
+                    scroller.clientHeight *
+                    CONFIG.stepScreens
+                );
+
+
+            const oldTop =
+                scroller.scrollTop;
+
+
+            const oldHeight =
+                scroller.scrollHeight;
+
+
+            scroller.scrollTo({
+
+                top:
+                    Math.max(
+                        0,
+                        oldTop - step
+                    ),
+
+                behavior:
+                    'auto'
+            });
+
+
+            /*
+             * 这里只等待浏览器完成本轮滚动。
+             */
+            await sleep(
+                CONFIG.scrollDelay
+            );
+
+
+            /*
+             * ==========================================
+             * 刚滚完立即再次检测时间轴
+             * ==========================================
+             */
+
+            if (
+                detectNativeTimeline()
+            ) {
+
+                console.log(
+                    '[Timeline] 原生时间轴已出现'
+                );
+
+
+                return {
+
+                    success: true,
+
+                    reason:
+                        'timeline',
+
+                    scroller
+                };
+            }
+
+
+            let currentMin =
+                getMinMountedTurn();
+
+
+            /*
+             * Console 日志。
+             *
+             * 每十轮打印一次，
+             * 或 minTurn 发生变化时打印。
+             */
+            if (
+                round === 1 ||
+
+                round % 10 === 0 ||
+
+                currentMin !== previousMin
+            ) {
+
+                console.log(
+
+                    `[Timeline] 第 ${round} 轮`,
+
+                    'scrollTop =',
+                    Math.round(
+                        scroller.scrollTop
+                    ),
+
+                    '最早 turn =',
+                    currentMin
+                );
+            }
+
+
+            /*
+             * ==========================================
+             * 到达当前这一批虚拟列表顶部
+             * ==========================================
+             */
+
+            if (
+                scroller.scrollTop <
+                100
+            ) {
+
+                /*
+                 * 再明确贴到顶部。
+                 */
+                scroller.scrollTop =
+                    0;
+
+
+                /*
+                 * 主动派发一次 scroll，
+                 * 帮助触发 ChatGPT 的旧消息加载。
+                 */
+                scroller.dispatchEvent(
+
+                    new Event(
+                        'scroll',
+                        {
+                            bubbles: true
+                        }
+                    )
+                );
+
+
+                console.log(
+                    '[Timeline] 到达当前批次顶部，等待旧内容或时间轴'
+                );
+
+
+                /*
+                 * ======================================
+                 * 等待更早消息真正加载
+                 * ======================================
+                 */
+
+                const waitResult =
+                    await waitForOlderContent(
+
+                        scroller,
+
+                        currentMin,
+
+                        oldHeight,
+
+                        CONFIG.olderContentTimeout,
+
+                        serial,
+
+                        conversationKey
+                    );
+
+
+                /*
+                 * conversation 已切换。
+                 */
+                if (
+                    waitResult.cancelled
+                ) {
+
+                    return {
+
+                        success: false,
+
+                        cancelled: true,
+
+                        scroller
+                    };
+                }
+
+
+                /*
+                 * --------------------------------------
+                 * 时间轴出现：
+                 * 最高优先级，立即成功
+                 * --------------------------------------
+                 */
+
+                if (
+                    waitResult.timeline
+                ) {
+
+                    console.log(
+                        '[Timeline] 检测到原生时间轴，立即返回'
+                    );
+
+
+                    return {
+
+                        success: true,
+
+                        reason:
+                            'timeline',
+
+                        scroller
+                    };
+                }
+
+
+                /*
+                 * --------------------------------------
+                 * 已到明确的最前面
+                 * --------------------------------------
+                 */
+
+                if (
+                    waitResult.reachedStart
+                ) {
+
+                    const appeared =
+                        await waitForTimeline(
+
+                            serial,
+
+                            conversationKey,
+
+                            CONFIG.finalTimelineWait
+                        );
+
+
+                    return {
+
+                        success: true,
+
+                        reason:
+                            appeared
+                                ? 'timeline'
+                                : 'top',
+
+                        scroller
+                    };
+                }
+
+
+                /*
+                 * --------------------------------------
+                 * 成功加载出更早内容
+                 * --------------------------------------
+                 */
+
+                if (
+                    waitResult.loaded
+                ) {
+
+                    previousMin =
+                        waitResult.minTurn ??
+                        currentMin;
+
+
+                    /*
+                     * 回主循环继续高速向上。
+                     */
+                    continue;
+                }
+
+
+                /*
+                 * ======================================
+                 * 第一次等待没有加载出更早内容
+                 *
+                 * 重新触发顶部加载。
+                 * ======================================
+                 */
+
+                let retryLoaded =
+                    false;
+
+
+                for (
+                    let retry = 1;
+                    retry <= CONFIG.maxRetries;
+                    retry++
+                ) {
+
+                    /*
+                     * 重试前先看时间轴是否已经出来。
+                     */
+                    if (
+                        detectNativeTimeline()
+                    ) {
+
+                        console.log(
+                            '[Timeline] 时间轴已经出现，取消顶部重试'
+                        );
+
+
+                        return {
+
+                            success: true,
+
+                            reason:
+                                'timeline',
+
+                            scroller
+                        };
+                    }
+
+
+                    console.log(
+                        `[Timeline] 顶部重试 ${retry}/${CONFIG.maxRetries}`
+                    );
+
+
+                    /*
+                     * 稍微向下挪一点。
+                     */
+                    scroller.scrollTop =
+                        300;
+
+
+                    await sleep(100);
+
+
+                    /*
+                     * 再重新撞顶部。
+                     */
+                    scroller.scrollTop =
+                        0;
+
+
+                    scroller.dispatchEvent(
+
+                        new Event(
+                            'scroll',
+                            {
+                                bubbles: true
+                            }
+                        )
+                    );
+
+
+                    const retryHeight =
+                        scroller.scrollHeight;
+
+
+                    /*
+                     * 等待这一轮重试的结果。
+                     */
+                    const retryResult =
+                        await waitForOlderContent(
+
+                            scroller,
+
+                            currentMin,
+
+                            retryHeight,
+
+                            CONFIG.retryTimeout,
+
+                            serial,
+
+                            conversationKey
+                        );
+
+
+                    /*
+                     * conversation 已切换。
+                     */
+                    if (
+                        retryResult.cancelled
+                    ) {
+
+                        return {
+
+                            success: false,
+
+                            cancelled: true,
+
+                            scroller
+                        };
+                    }
+
+
+                    /*
+                     * ----------------------------------
+                     * 重试过程中时间轴出现
+                     * ----------------------------------
+                     */
+
+                    if (
+                        retryResult.timeline
+                    ) {
+
+                        console.log(
+                            '[Timeline] 重试期间检测到原生时间轴'
+                        );
+
+
+                        return {
+
+                            success: true,
+
+                            reason:
+                                'timeline',
+
+                            scroller
+                        };
+                    }
+
+
+                    /*
+                     * ----------------------------------
+                     * 到达真正顶部
+                     * ----------------------------------
+                     */
+
+                    if (
+                        retryResult.reachedStart
+                    ) {
+
+                        return {
+
+                            success: true,
+
+                            reason:
+                                'top',
+
+                            scroller
+                        };
+                    }
+
+
+                    /*
+                     * ----------------------------------
+                     * 重试成功加载出更早内容
+                     * ----------------------------------
+                     */
+
+                    if (
+                        retryResult.loaded
+                    ) {
+
+                        previousMin =
+                            retryResult.minTurn ??
+                            currentMin;
+
+
+                        retryLoaded =
+                            true;
+
+
+                        /*
+                         * 回主循环继续向上。
+                         */
+                        break;
+                    }
+                }
+
+
+                /*
+                 * ======================================
+                 * 连续多次没有加载出更早内容
+                 * ======================================
+                 *
+                 * 说明当前顶部已经稳定。
+                 *
+                 * 注意：
+                 * ChatGPT 最早 turn 不一定必须是 0，
+                 * 所以这里不能无限等待 turn-0。
+                 */
+
+                if (
+                    !retryLoaded
+                ) {
+
+                    console.log(
+                        '[Timeline] 顶部已经稳定'
+                    );
+
+
+                    /*
+                     * 最后给原生时间轴一点初始化时间。
+                     */
+                    const appeared =
+                        await waitForTimeline(
+
+                            serial,
+
+                            conversationKey,
+
+                            CONFIG.finalTimelineWait
+                        );
+
+
+                    return {
+
+                        success: true,
+
+                        reason:
+                            appeared
+                                ? 'timeline'
+                                : 'stable-top',
+
+                        scroller
+                    };
+                }
+            }
+
+
+            /*
+             * 保存本轮最早 turn，
+             * 下一轮用于比较。
+             */
+            previousMin =
+                currentMin ??
+                previousMin;
+        }
+    }
+
+
+    /*
+     * ==================================================
+     * 单个 conversation 的完整唤醒流程
+     * ==================================================
+     */
+
+    async function wakeConversation(
+        conversationKey,
+        serial
+    ) {
+
+        console.log(
+            '[Timeline] 当前 conversation：',
+            conversationKey
+        );
+
+
+        /*
+         * 如果原生时间轴本来就已经存在，
+         * 不做任何事情。
+         */
+        if (
+            detectNativeTimeline()
+        ) {
+
+            console.log(
+                '[Timeline] 原生时间轴已经存在，无需处理'
+            );
+
+            return;
+        }
+
+
+        /*
+         * 等待当前 conversation DOM。
+         */
+        const turn =
+            await waitForConversation(
+
+                serial,
+
+                conversationKey
+            );
+
+
+        /*
+         * 没有找到 DOM。
+         *
+         * 不弹 alert，
+         * 避免干扰正常聊天。
+         */
+        if (!turn) {
+
+            if (
+                runStillValid(
+                    serial,
+                    conversationKey
+                )
+            ) {
+
+                console.warn(
+                    '[Timeline] 等待对话 DOM 超时，本次跳过'
+                );
+            }
+
+
+            return;
+        }
+
+
+        /*
+         * 用户已经切换 conversation。
+         */
+        if (
+            !runStillValid(
+                serial,
+                conversationKey
+            )
+        ) {
+
+            return;
+        }
+
+
+        /*
+         * DOM 出现以后再检查一次时间轴。
+         */
+        if (
+            detectNativeTimeline()
+        ) {
+
+            console.log(
+                '[Timeline] 时间轴已经出现，无需上滚'
+            );
+
+            return;
+        }
+
+
+        /*
+         * 找滚动容器。
+         */
+        let scroller =
+            findScroller(turn);
+
+
+        if (!scroller) {
+
+            console.warn(
+                '[Timeline] 没有找到对话滚动区域'
+            );
+
+            return;
+        }
+
+
+        /*
+         * 保存用户原来的位置。
+         */
+        const original =
+            capturePosition(
+                scroller
+            );
+
+
+        console.log(
+            '[Timeline] 保存原始阅读位置',
+            original
+        );
+
+
+        /*
+         * ==============================================
+         * 开始向上寻找时间轴
+         * ==============================================
+         */
+
+        const result =
+            await crawlUntilTimeline(
+
+                scroller,
+
+                serial,
+
+                conversationKey
+            );
+
+
+        /*
+         * 用户中途切换 conversation。
+         */
+        if (
+            result.cancelled
+        ) {
+
+            return;
+        }
+
+
+        /*
+         * 理论上只有异常情况下才会失败。
+         */
+        if (
+            !result.success
+        ) {
+
+            console.warn(
+                '[Timeline] 本次没有成功完成唤醒流程'
+            );
+
+            return;
+        }
+
+
+        scroller =
+            result.scroller ||
+            scroller;
+
+
+        /*
+         * ==============================================
+         * 如果就是检测到时间轴而成功：
+         *
+         * 极短等待后马上返回。
+         * ==============================================
+         */
+
+        if (
+            result.reason ===
+            'timeline'
+        ) {
+
+            console.log(
+                '[Timeline] 原生时间轴已出现，准备返回'
+            );
+
+
+            await sleep(
+                CONFIG.timelineSettleDelay
+            );
+        }
+
+
+        /*
+         * ==============================================
+         * 如果是到达真正顶部 / 稳定顶部：
+         *
+         * 再给时间轴最后一点初始化时间。
+         * ==============================================
+         */
+
+        else {
+
+            await waitForTimeline(
+
+                serial,
+
+                conversationKey,
+
+                CONFIG.finalTimelineWait
+            );
+        }
+
+
+        /*
+         * 返回前再次确认用户没有切换 conversation。
+         */
+        if (
+            !runStillValid(
+                serial,
+                conversationKey
+            )
+        ) {
+
+            return;
+        }
+
+
+        /*
+         * ==============================================
+         * 恢复原阅读位置
+         * ==============================================
+         */
+
+        restorePosition(
+            scroller,
+            original
+        );
+
+
+        console.log(
+            '[Timeline] 本轮完成，原因：',
+            result.reason
+        );
+    }
+
+
+    /*
+     * ==================================================
+     * 调度任务
+     * ==================================================
+     */
+
+    function scheduleWake(
+        conversationKey
+    ) {
+
+        clearTimeout(
+            scheduledTimer
+        );
+
+
+        /*
+         * 新任务开始，
+         * 自动让之前的异步任务失效。
+         */
+        const serial =
+            ++runSerial;
+
+
+        scheduledTimer =
+            setTimeout(
+                () => {
+
+                    wakeConversation(
+                        conversationKey,
+                        serial
+                    );
+
+                },
+
+                CONFIG.routeDelay
+            );
+    }
+
+
+    /*
+     * ==================================================
+     * 检测 SPA conversation 切换
+     * ==================================================
+     *
+     * 这里只比较 URL 中的 conversation ID。
+     *
+     * 因此：
+     *
+     * 发送一条新消息
+     *      → conversation ID 不变
+     *      → 不会重新爬顶部
+     *
+     * 点击左侧另一个对话
+     *      → conversation ID 改变
+     *      → 自动执行唤醒
+     */
+
+    function checkConversationChange() {
+
+        const key =
+            getConversationKey();
+
+
+        /*
+         * 仍然是当前 conversation。
+         */
+        if (
+            key ===
+            lastConversationKey
+        ) {
+
+            return;
+        }
+
+
+        /*
+         * 让上一轮任务失效。
+         */
+        runSerial++;
+
+
+        lastConversationKey =
+            key;
+
+
+        /*
+         * 首页 / 新建对话等没有 conversation ID 的页面
+         * 不需要执行。
+         */
+        if (!key) {
+
+            return;
+        }
+
+
+        scheduleWake(
+            key
+        );
+    }
+
+
+    /*
+     * ChatGPT 是 SPA。
+     *
+     * 每 500ms 只检查一次 pathname，
+     * 开销极小，也比依赖具体 React 路由事件稳定。
+     */
+    setInterval(
+        checkConversationChange,
+        500
+    );
+
+
+    /*
+     * ==================================================
+     * 当前页面首次启动
+     * ==================================================
+     */
+
+    lastConversationKey =
+        getConversationKey();
+
+
+    if (
+        lastConversationKey
+    ) {
+
+        scheduleWake(
+            lastConversationKey
+        );
+    }
+
+
+    console.log(
+        '[Timeline] ChatGPT 原生时间轴自动唤醒脚本已加载'
+    );
+
+})();
