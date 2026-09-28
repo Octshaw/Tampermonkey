@@ -1,0 +1,561 @@
+// ==UserScript==
+// @name         ChatGPT 独立提问导航栏
+// @namespace    chatgpt-independent-question-navigation
+// @version      0.5.0-beta
+// @description  独立消息导航；默认预加载约10条近期用户消息，数量可设，支持纯附件消息
+// @match        https://chatgpt.com/*
+// @match        https://www.chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+    'use strict';
+    const ROOT = 'independent-question-nav';
+    if (window.top !== window.self || document.getElementById(ROOT)) return;
+
+    const CFG = {
+        initialMessageCount: 10, // 默认预加载消息条数；0关闭，不是目录条数上限
+        preloadDelayMs: 1600,   // 给新对话初始布局一点稳定时间
+        preloadNoProgressMs: 8000, // 预加载持续无进展时返回底部，不认定全量
+        stepScreens: 0.8,       // 收集时保留相邻屏幕重叠，不跳过大量消息
+        settleMs: 180,
+        noProgressMs: 20000,    // 连续无进展才暂停，不限制总运行时间
+        previewChars: 240
+    };
+    const SETTING_KEY = 'initialMessageCount';
+    const validCount = n => Number.isInteger(n) && n >= 0 && n <= 200;
+    let preloadCount = CFG.initialMessageCount;
+    try {
+        if (typeof GM_getValue === 'function') {
+            const saved = GM_getValue(SETTING_KEY, preloadCount);
+            if (validCount(saved)) preloadCount = saved;
+        }
+    } catch { /* 存储不可用时使用默认值 */ }
+
+    const BUBBLE = '[data-user-message-bubble]';
+    // 来自已采集页面的用户外层标记，不能只扫描文字气泡。
+    const USER_GROUP = [
+        '[class~="group/user-message"][data-chatgpt-search-message-ids]',
+        '[class~="group/user-message"][data-chatgpt-search-unit-key]'
+    ].join(',');
+    const USER = `${USER_GROUP},${BUBBLE}`;
+    const SCROLL = '.thread-scroll-container,[data-app-action-timeline-scroll]';
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const route = () => location.pathname.match(/\/c\/([^/?#]+)/)?.[1] || null;
+    const records = new Map();
+    const edges = new Map();
+    let key = route(), scroller = null, observer = null, timer = null;
+    let mounted = new Map(), ordered = [], task = null, drawSignature = '';
+    let paused = false, readyAfter = Date.now() + CFG.preloadDelayMs;
+    let autoPending = true; // 每次进入一个对话只尝试一次，不随新消息重启
+
+    const host = document.createElement('div');
+    host.id = ROOT;
+    host.style.cssText = 'position:fixed;right:14px;top:90px;bottom:110px;'
+        + 'width:44px;z-index:2147483000;pointer-events:none';
+    const shadow = host.attachShadow({mode: 'open'});
+    const style = document.createElement('style');
+    style.textContent = `
+        :host { font:12px/1.5 system-ui,sans-serif; color-scheme:light dark; }
+        * { box-sizing:border-box; }
+        [hidden] { display:none!important; }
+        .wrap { height:100%; display:flex; flex-direction:column; gap:8px; }
+        details { pointer-events:auto; }
+        summary { cursor:pointer; text-align:center; list-style:none;
+            border-radius:6px; background:Canvas; color:CanvasText; padding:4px; }
+        .tools { position:absolute; right:50px; top:0; width:260px;
+            background:Canvas; color:CanvasText; border:1px solid #888;
+            padding:12px; border-radius:10px; box-shadow:0 4px 16px #0002; }
+        .tools p { margin:6px 0; }
+        .settings { margin:8px 0; }
+        .settings input { width:64px; margin:0 5px; padding:3px;
+            background:Canvas; color:CanvasText; border:1px solid #888; }
+        .hint { font-size:11px; opacity:.8; }
+        summary.busy { font-weight:bold; outline:1px solid currentColor; }
+        .tools button { margin:4px 5px 0 0; padding:4px 7px; cursor:pointer; }
+        .rail { overflow:auto; overscroll-behavior:contain; flex:0 1 auto;
+            margin:auto 0; pointer-events:auto; scrollbar-width:thin; }
+        .line { display:flex; justify-content:flex-end; align-items:center;
+            width:100%; height:12px; min-height:12px; border:0; padding:0 4px;
+            background:transparent; color:CanvasText; cursor:pointer; }
+        .line::after { content:''; width:24px; height:2px;
+            background:currentColor; opacity:.38; border-radius:2px; }
+        .line:hover::after,.line:focus-visible::after { width:32px; opacity:.85; }
+        .line.active::after { width:34px; height:3px; opacity:1; }
+        .tip { position:fixed; right:66px; max-width:min(360px,70vw);
+            padding:9px 11px; background:Canvas; color:CanvasText;
+            border:1px solid #888; border-radius:8px; overflow-wrap:anywhere;
+            box-shadow:0 4px 16px #0002; pointer-events:none; }
+    `;
+    const make = (tag, cls, text) => {
+        const el = document.createElement(tag);
+        if (cls) el.className = cls;
+        if (text) el.textContent = text;
+        return el;
+    };
+    const wrap = make('div', 'wrap');
+    const details = make('details');
+    const summary = make('summary', '', '导');
+    summary.title = '打开提问导航工具';
+    const tools = make('div', 'tools');
+    const count = make('b', '', '已记录 0 条用户消息 · 非全量');
+    const status = make('p', '', '手动浏览时自动收集；也可点击“向前收集”。');
+    const rail = make('nav', 'rail');
+    rail.setAttribute('aria-label', '已记录的用户消息（含附件）');
+    const tip = make('div', 'tip');
+    tip.hidden = true;
+    tools.append(count, status);
+    details.append(summary, tools);
+    wrap.append(details, rail);
+    shadow.append(style, wrap, tip);
+    document.body.append(host);
+
+    function say(text) { status.textContent = text; }
+    function cancel(text = '已停止，保留已记录提问。') {
+        autoPending = false;
+        if (task) task.cancelled = true;
+        task = null;
+        summary.classList.remove('busy');
+        say(text);
+    }
+    function guard(t) {
+        if (t.cancelled || task !== t || route() !== t.route) {
+            throw new DOMException('任务已取消', 'AbortError');
+        }
+        if (paused) throw new Error('目录需要清空重建。');
+        if (!scroller?.isConnected) throw new Error('滚动区域暂不可用，请稍后重试。');
+    }
+    function metrics(s = scroller) {
+        const range = Math.max(0, s.scrollHeight - s.clientHeight);
+        const reverse = getComputedStyle(s).flexDirection === 'column-reverse';
+        return {range, top: reverse ? -range : 0, bottom: reverse ? 0 : range};
+    }
+    function move(t, value) {
+        guard(t);
+        const m = metrics();
+        scroller.scrollTo({top: Math.max(m.top, Math.min(m.bottom, value)),
+            behavior: 'instant'});
+    }
+    function origin() {
+        return scroller.getBoundingClientRect().top + scroller.clientTop;
+    }
+    function identity(el) {
+        const group = el.closest('[data-chatgpt-search-message-ids]');
+        const unit = el.closest('[data-chatgpt-search-unit-key]');
+        const g = group?.getAttribute('data-chatgpt-search-message-ids');
+        const u = unit?.getAttribute('data-chatgpt-search-unit-key');
+        // 不用 DOM 下标、文字或匿名编号冒充消息标识。
+        return g ? `group:${g}` : u ? `unit:${u}` : null;
+    }
+
+    // 同一消息的外层、内层气泡都可能被选中，先按实际外层节点归并。
+    // 不把所有 search-message-ids 都当成用户消息，助手也有这个属性。
+    function userRoots(scope) {
+        const roots = new Set();
+        for (const el of scope.querySelectorAll(USER)) {
+            const group = el.closest(USER_GROUP);
+            const root = group && scope.contains(group) ? group : el;
+            if (identity(root)) roots.add(root);
+        }
+        return [...roots];
+    }
+    function hasBox(el) {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 &&
+            s.display !== 'none' && s.visibility !== 'hidden';
+    }
+    function messageAnchor(root) {
+        if (hasBox(root)) return root;
+        // 外层若为 display:contents，则选其实际显示的子元素定位。
+        return [...root.querySelectorAll('*')].find(hasBox) || null;
+    }
+    function preview(root) {
+        const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+        const bubbles = root.matches(BUBBLE)
+            ? [root] : [...root.querySelectorAll(BUBBLE)];
+        const text = clean(bubbles.map(el => el.textContent || '').join(' '));
+        const names = new Set();
+        const excluded = `${BUBBLE},script,style,template,svg,textarea,` +
+            '[contenteditable="true"],[hidden],[aria-hidden="true"],.sr-only';
+        // 仅识别卡片上能读取的完整文件名；不请求/解析附件文件。
+        const filename = /\.(?:pdf|docx?|xlsx?|xlsm|pptx?|csv|tsv|txt|md|json|jsonl|ya?ml|xml|html?|rtf|tex|bib|py|js|ts|jsx|tsx|ipynb|c|cpp|h|hpp|java|log|zip|7z|rar|tar|gz|png|jpe?g|gif|webp|bmp|svg|heic|tiff?|mp3|wav|m4a|mp4|mov|stl|obj|ply|urdf|usd[acz]?)$/i;
+        const eligible = el => el && !el.closest(excluded) && hasBox(el);
+        const add = value => {
+            const s = clean(value).replace(/^(?:文件|附件|file|attachment)\s*[:：]\s*/i, '');
+            if (s && s.length <= 180 && !/[\\/]/.test(s) && filename.test(s)) {
+                names.add(s);
+            }
+        };
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let node, n = 0;
+        while ((node = walker.nextNode()) && n++ < 300) {
+            if (eligible(node.parentElement)) add(node.nodeValue);
+        }
+        for (const el of root.querySelectorAll('[title],[aria-label],img[alt]')) {
+            if (!eligible(el)) continue;
+            add(el.getAttribute('title'));
+            add(el.getAttribute('aria-label'));
+            add(el.getAttribute('alt'));
+        }
+        const list = [...names];
+        const label = list.length
+            ? `【附件：${list.slice(0, 4).join('、')}${list.length > 4 ? '等' : ''}】`
+            : '';
+        return (clean(`${label} ${text}`) ||
+            '【无文字消息】附件或其他非文字内容（未识别到文件名）')
+            .slice(0, CFG.previewChars);
+    }
+
+    function clearIndex(text) {
+        cancel(text);
+        records.clear(); edges.clear(); mounted.clear(); ordered = [];
+        drawSignature = ''; rail.replaceChildren(); tip.hidden = true;
+        count.textContent = '已记录 0 条用户消息 · 非全量';
+    }
+
+    // 同一屏的实际上下顺序形成约束；未连接片段暂按缓存坐标排列。
+    // 显示序号只是已记录目录的位置，不是整段对话的真实消息序号。
+    function orderKeys() {
+        const degree = new Map([...records.keys()].map(k => [k, 0]));
+        for (const targets of edges.values()) for (const b of targets) {
+            if (degree.has(b)) degree.set(b, degree.get(b) + 1);
+        }
+        const ready = [...degree].filter(([, n]) => !n).map(([k]) => k);
+        const out = [];
+        while (ready.length) {
+            ready.sort((a, b) => records.get(a).y - records.get(b).y);
+            const a = ready.shift(); out.push(a);
+            for (const b of edges.get(a) || []) {
+                degree.set(b, degree.get(b) - 1);
+                if (degree.get(b) === 0) ready.push(b);
+            }
+        }
+        return out.length === records.size ? out : null;
+    }
+    function harvest() {
+        if (paused || !key || route() !== key || !scroller?.isConnected) return;
+        const base = origin(), rows = [], frequency = new Map();
+        for (const root of userRoots(scroller)) {
+            const id = identity(root), el = messageAnchor(root);
+            if (!id || !el) continue;
+            const r = el.getBoundingClientRect();
+            const turn = root.closest('[data-turn-key]')?.getAttribute('data-turn-key');
+            rows.push({id, root, el, turn, rect: r, y: scroller.scrollTop + r.top - base});
+            frequency.set(id, (frequency.get(id) || 0) + 1);
+        }
+        // 遇到重复标识时不按下标强行选择。
+        const unique = rows.filter(r => frequency.get(r.id) === 1)
+            .sort((a, b) => a.rect.top - b.rect.top);
+        mounted = new Map(unique.map(r => [r.id, r]));
+        const shifts = unique.filter(r => records.has(r.id))
+            .map(r => r.y - records.get(r.id).y).sort((a, b) => a - b);
+        if (shifts.length >= 2 && shifts.at(-1) - shifts[0] < 24) {
+            const shift = shifts[Math.floor(shifts.length / 2)];
+            for (const r of records.values()) if (!mounted.has(r.id)) r.y += shift;
+        }
+        for (const r of unique) {
+            records.set(r.id, {id:r.id, turn:r.turn, y:r.y,
+                text:preview(r.root)});
+            if (!edges.has(r.id)) edges.set(r.id, new Set());
+        }
+        for (let i = 1; i < unique.length; i++) {
+            edges.get(unique[i - 1].id).add(unique[i].id);
+        }
+        const next = orderKeys();
+        if (!next) {
+            paused = true;
+            cancel('检测到消息顺序冲突，请点击“清空重建”。');
+            return;
+        }
+        ordered = next;
+        render();
+    }
+    function render() {
+        count.textContent = `已记录 ${records.size} 条用户消息 · 非全量`;
+        summary.title = `消息导航：已记录 ${records.size} 条（非全量）`;
+        const signature = JSON.stringify(ordered);
+        if (signature !== drawSignature) {
+            drawSignature = signature; tip.hidden = true;
+            const oldScroll = rail.scrollTop, fragment = document.createDocumentFragment();
+            ordered.forEach((id, i) => {
+                const button = make('button', 'line');
+                button.type = 'button';
+                button.setAttribute('aria-label', `已记录目录第 ${i + 1} 项`);
+                button.onclick = () => start('定位提问', t => locate(t, id));
+                const show = () => {
+                    tip.textContent = `目录 ${i + 1} · ${records.get(id)?.text || ''}`;
+                    tip.hidden = false;
+                    const y = button.getBoundingClientRect().top;
+                    tip.style.top = `${Math.max(8, Math.min(y, innerHeight - tip.offsetHeight - 8))}px`;
+                };
+                button.onmouseenter = button.onfocus = show;
+                button.onmouseleave = button.onblur = () => { tip.hidden = true; };
+                fragment.append(button);
+            });
+            rail.replaceChildren(fragment); rail.scrollTop = oldScroll;
+        }
+        const ref = origin() + Math.min(180, scroller.clientHeight * .25);
+        let active = null;
+        for (const r of mounted.values()) {
+            if (r.rect.top <= ref) active = r.id;
+        }
+        [...rail.children].forEach((button, i) => {
+            button.classList.toggle('active', ordered[i] === active);
+        });
+    }
+    function scheduleHarvest() {
+        if (!timer) timer = setTimeout(() => { timer = null; safeHarvest(); }, 120);
+    }
+    function safeHarvest() {
+        try { harvest(); }
+        catch { cancel('读取页面结构失败；可清空重建后重试。'); }
+    }
+    async function start(label, action, kind = 'manual') {
+        cancel(); tick(false); safeHarvest();
+        if (paused || !key || !scroller) {
+            say('当前没有可用的消息区域，或目录需要清空重建。'); return;
+        }
+        const t = {route:key, cancelled:false, kind}; task = t;
+        summary.classList.add('busy');
+        say(`${label}中；按 Esc 或“停止”可中断。`);
+        try {
+            const result = await action(t);
+            guard(t);
+            say(result);
+        } catch (error) {
+            if (error.name !== 'AbortError' && task === t) say(error.message);
+        } finally {
+            if (task === t) { task = null; summary.classList.remove('busy'); }
+        }
+    }
+
+    // 核心：每次定位都重新按标识找当前节点，核验后才报告成功。
+    async function align(t, id) {
+        for (let i = 0; i < 6; i++) {
+            guard(t); harvest();
+            const row = mounted.get(id);
+            if (!row || identity(row.el) !== id) return false;
+            move(t, scroller.scrollTop + row.el.getBoundingClientRect().top - origin() - 90);
+            await sleep(CFG.settleMs); guard(t); harvest();
+            const current = mounted.get(id);
+            if (!current || identity(current.el) !== id) continue;
+            const r = current.el.getBoundingClientRect();
+            const y = r.top - origin();
+            if (y >= 0 && y < scroller.clientHeight - 160) {
+                current.el.animate([{outline:'2px solid currentColor'}, {outline:'2px solid transparent'}],
+                    {duration:850});
+                return true;
+            }
+        }
+        return false;
+    }
+    async function walkUp(t, targetId = null, options = {}) {
+        const targetCount = options.targetCount || 0;
+        const seenUsers = options.seenUsers || new Set();
+        const noProgressMs = options.noProgressMs ?? CFG.noProgressMs;
+        const seenTurns = new Set();
+        let best = -Infinity, progressAt = performance.now();
+        let lastSize = records.size;
+        while (true) {
+            guard(t);
+            if (document.hidden) {
+                await sleep(300); progressAt = performance.now(); continue;
+            }
+            harvest();
+            for (const id of mounted.keys()) seenUsers.add(id);
+            if (targetCount) {
+                say(`预加载近期用户消息：已记录 ${seenUsers.size} / 目标 ${targetCount}；Esc 可停止。`);
+                if (seenUsers.size >= targetCount) return true;
+            }
+            if (targetId && mounted.has(targetId) && await align(t, targetId)) return true;
+            const m = metrics(), upward = m.bottom - scroller.scrollTop;
+            let newTurn = false;
+            for (const el of scroller.querySelectorAll('[data-turn-key]')) {
+                const id = el.getAttribute('data-turn-key');
+                if (id && !seenTurns.has(id)) { seenTurns.add(id); newTurn = true; }
+            }
+            if (upward > best + 8 || records.size > lastSize || newTurn) {
+                best = Math.max(best, upward); lastSize = records.size;
+                progressAt = performance.now();
+            }
+            if (performance.now() - progressAt > noProgressMs) return false;
+            const atEdge = scroller.scrollTop - m.top < 4;
+            if (!atEdge) {
+                move(t, scroller.scrollTop - Math.max(120, scroller.clientHeight * CFG.stepScreens));
+            }
+            await sleep(atEdge ? 300 : CFG.settleMs);
+        }
+    }
+    async function locate(t, id) {
+        if (!records.has(id)) throw new Error('这条提问已不在当前目录，请重新收集。');
+        if (await align(t, id)) return '已按消息标识定位。';
+        // 缓存坐标只是预定位，不是跳转成功判据。
+        move(t, records.get(id).y - 90);
+        for (let i = 0; i < 8; i++) {
+            await sleep(CFG.settleMs); guard(t);
+            if (await align(t, id)) return '已按消息标识定位。';
+        }
+        say('缓存位置未命中，正在从底部向上按标识查找；Esc 可停止。');
+        move(t, metrics().bottom);
+        await sleep(400); guard(t);
+        if (await walkUp(t, id)) return '已按消息标识定位。';
+        return '暂停：尚未找到目标，未宣称跳转成功。可手动翻到附近后重试。';
+    }
+    // 数量是本次从底部向上遇到的用户消息数，不能拿旧缓存总数代替。
+    // 纯附件也计为一条；同条消息的多个文件已由 userRoots 去重。
+    async function toBottom(t) {
+        for (let i = 0; i < 3; i++) {
+            move(t, metrics().bottom);
+            await sleep(CFG.settleMs);
+            guard(t);
+            harvest();
+        }
+    }
+    async function preloadRecent(t) {
+        const target = preloadCount;
+        if (!target) return '预加载已关闭，仍随手动浏览收集。';
+        await toBottom(t);
+        const seenUsers = new Set();
+        const reached = await walkUp(t, null, {
+            targetCount: target,
+            seenUsers,
+            noProgressMs: CFG.preloadNoProgressMs
+        });
+        guard(t);
+        // 只在正常结束时回底部；中途手动取消或换对话不再移动页面。
+        await toBottom(t);
+        return reached
+            ? `已预加载 ${seenUsers.size} 条近期用户消息并返回底部；目录仍可继续增加。`
+            : `本次记录 ${seenUsers.size} / 目标 ${target} 条，因无新进展停止并返回底部；不代表历史已加载完整。`;
+    }
+    function maybePreload() {
+        if (!autoPending || paused || task || !scroller?.isConnected || !mounted.size) return;
+        if (Date.now() < readyAfter || document.hidden) return;
+        if (!preloadCount) { autoPending = false; return; }
+
+        // 已在历史中间阅读，不擅自先把人拉回底部。
+        if (Math.abs(scroller.scrollTop - metrics().bottom) > 120) {
+            autoPending = false;
+            say('当前停在历史位置，本次不自动预加载；可用“补齐最近”手动启动。');
+            return;
+        }
+        // 以下仅为尽力识别生成状态，不把它当成通用页面协议。
+        const generating = document.querySelector(
+            '[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="停止生成"]'
+        );
+        if (generating && hasBox(generating)) return;
+
+        const editor = document.querySelector('#prompt-textarea');
+        if (editor && (editor.textContent || editor.value || '').trim()) {
+            autoPending = false;
+            say('输入框已有内容，本次不自动预加载。');
+            return;
+        }
+        autoPending = false;
+        void start('预加载近期消息', preloadRecent, 'preload');
+    }
+
+    // 设置只保存这一个数字，不保存聊天正文、文件名或消息标识。
+    const settingRow = make('div', 'settings');
+    const settingLabel = make('label', '', '预加载用户消息');
+    const amount = make('input');
+    amount.type = 'number';
+    amount.min = '0'; amount.max = '200'; amount.step = '1';
+    amount.value = String(preloadCount);
+    amount.setAttribute('aria-label', '预加载用户消息条数');
+    settingLabel.append(amount, document.createTextNode('条'));
+    const saveButton = make('button', '', '保存');
+    saveButton.type = 'button';
+    saveButton.onclick = () => {
+        const value = amount.valueAsNumber;
+        if (!validCount(value)) { say('请输入 0～200 的整数；0 为关闭自动预加载。'); return; }
+        autoPending = false;
+        if (task?.kind === 'preload') cancel('已停止当前预加载。');
+        preloadCount = value;
+        let persistent = false;
+        try {
+            if (typeof GM_setValue === 'function') {
+                GM_setValue(SETTING_KEY, value);
+                persistent = true;
+            }
+        } catch { /* 当前页面仍使用新值 */ }
+        say((persistent ? '设置已保存。' : '本页已应用，但无法持久保存。') +
+            (value ? `下次进入对话目标 ${value} 条；当前可点“补齐最近”。` : '自动预加载关闭；手动浏览仍会记录。'));
+    };
+    settingRow.append(settingLabel, saveButton);
+    tools.append(settingRow, make('p', 'hint', '0 = 不自动加载。此数字是启动目标，不是目录上限；修改后下次进入对话生效。'));
+
+    function addButton(text, action) {
+        const button = make('button', '', text);
+        button.type = 'button'; button.onclick = action; tools.append(button);
+    }
+    addButton('补齐最近', () => start('预加载近期消息', preloadRecent, 'preload'));
+    addButton('向前收集', () => start('收集提问', async t => {
+        await walkUp(t);
+        return '收集已暂停：当前无新进展，不代表历史已全部加载。可继续收集或回底部。';
+    }));
+    addButton('停止', () => cancel());
+    addButton('回到底部', () => start('返回底部', async t => {
+        await toBottom(t); return '已返回当前滚动区域底部。';
+    }));
+    addButton('清空重建', () => {
+        paused = false; clearIndex('已清空，从当前页面重新记录。'); safeHarvest();
+    });
+
+    function tick(allowAuto = true) {
+        const current = route();
+        if (current !== key) {
+            key = current; paused = false; readyAfter = Date.now() + CFG.preloadDelayMs;
+            observer?.disconnect(); scroller = null;
+            clearIndex('已切换对话，从当前页面重新记录。');
+            autoPending = Boolean(key);
+        }
+        host.hidden = !key;
+        if (!key) return;
+        const candidates = [...document.querySelectorAll(SCROLL)];
+        const found = candidates.find(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width < 100 || r.height < 100 || !el.querySelector(USER)) return false;
+            const ids = [...el.querySelectorAll('[data-chatgpt-selection-conversation-id]')]
+                .map(n => n.getAttribute('data-chatgpt-selection-conversation-id')).filter(Boolean);
+            return !ids.length || ids.includes(key);
+        });
+        if (found && found !== scroller) {
+            observer?.disconnect(); scroller = found;
+            readyAfter = Math.max(readyAfter, Date.now() + CFG.preloadDelayMs);
+            observer = new MutationObserver(scheduleHarvest);
+            observer.observe(scroller, {subtree:true, childList:true, characterData:true,
+                attributes:true, attributeFilter:['data-chatgpt-search-message-ids',
+                    'data-chatgpt-search-unit-key', 'data-turn-key', 'data-user-message-bubble', 'title', 'aria-label', 'alt']});
+        }
+        safeHarvest();
+        if (allowAuto) maybePreload();
+    }
+    document.addEventListener('scroll', event => {
+        if (event.target === scroller) scheduleHarvest();
+    }, true);
+    // 自动滚动期间，用户手动操作会中止任务，不抢夺阅读位置。
+    for (const type of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
+        document.addEventListener(type, event => {
+            if (!event.isTrusted || route() !== key) return;
+            if (!task) {
+                if (autoPending) {
+                    autoPending = false;
+                    say('已开始手动操作，本次不自动预加载；可点“补齐最近”。');
+                }
+                return;
+            }
+            const escape = type === 'keydown' && event.key === 'Escape';
+            if (!escape && event.composedPath().includes(host)) return;
+            cancel('已由手动操作中止，保留已记录提问。');
+        }, {capture:true, passive:true});
+    }
+    window.addEventListener('resize', scheduleHarvest);
+    setInterval(() => tick(), 500);
+    tick();
+})();
